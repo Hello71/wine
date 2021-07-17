@@ -509,13 +509,16 @@ static BOOL copy_file( const WCHAR *source, const WCHAR *dest, COPYFILE2_EXTENDE
     BOOL *cancel_ptr = params ? params->pfCancel : NULL;
     PCOPYFILE2_PROGRESS_ROUTINE progress = params ? params->pProgressRoutine : NULL;
 
-    static const int buffer_size = 65536;
     HANDLE h1, h2;
     FILE_BASIC_INFORMATION info;
     IO_STATUS_BLOCK io;
     DWORD count;
     BOOL ret = FALSE;
-    char *buffer;
+    SRV_COPYCHUNK_COPY copychunk = {
+        .ChunkCount = 1,
+        .Chunk = { [0] = { .Length = 1UL<<30 } }
+    };
+    SRV_COPYCHUNK_RESPONSE copychunk_resp;
 
     if (cancel_ptr)
         FIXME("pfCancel is not supported\n");
@@ -525,11 +528,6 @@ static BOOL copy_file( const WCHAR *source, const WCHAR *dest, COPYFILE2_EXTENDE
     if (!source || !dest)
     {
         SetLastError( ERROR_INVALID_PARAMETER );
-        return FALSE;
-    }
-    if (!(buffer = HeapAlloc( GetProcessHeap(), 0, buffer_size )))
-    {
-        SetLastError( ERROR_NOT_ENOUGH_MEMORY );
         return FALSE;
     }
 
@@ -546,14 +544,12 @@ static BOOL copy_file( const WCHAR *source, const WCHAR *dest, COPYFILE2_EXTENDE
                            NULL, OPEN_EXISTING, 0, 0 )) == INVALID_HANDLE_VALUE)
     {
         WARN("Unable to open source %s\n", debugstr_w(source));
-        HeapFree( GetProcessHeap(), 0, buffer );
         return FALSE;
     }
 
     if (!set_ntstatus( NtQueryInformationFile( h1, &io, &info, sizeof(info), FileBasicInformation )))
     {
         WARN("GetFileInformationByHandle returned error for %s\n", debugstr_w(source));
-        HeapFree( GetProcessHeap(), 0, buffer );
         CloseHandle( h1 );
         return FALSE;
     }
@@ -569,7 +565,6 @@ static BOOL copy_file( const WCHAR *source, const WCHAR *dest, COPYFILE2_EXTENDE
         }
         if (same_file)
         {
-            HeapFree( GetProcessHeap(), 0, buffer );
             CloseHandle( h1 );
             SetLastError( ERROR_SHARING_VIOLATION );
             return FALSE;
@@ -581,28 +576,25 @@ static BOOL copy_file( const WCHAR *source, const WCHAR *dest, COPYFILE2_EXTENDE
                            info.FileAttributes, h1 )) == INVALID_HANDLE_VALUE)
     {
         WARN("Unable to open dest %s\n", debugstr_w(dest));
-        HeapFree( GetProcessHeap(), 0, buffer );
         CloseHandle( h1 );
         return FALSE;
     }
 
-    while (ReadFile( h1, buffer, buffer_size, &count, NULL ) && count)
+    /* wine extension: IOCTL_COPYCHUNK works even on local files */
+    ret = DeviceIoControl( h1, IOCTL_PREPARE_COPYCHUNK, NULL, 0,
+                           &copychunk.SourceFile, sizeof(copychunk.SourceFile), &count, NULL );
+    if (ret)
     {
-        char *p = buffer;
-        while (count != 0)
-        {
-            DWORD res;
-            if (!WriteFile( h2, p, count, &res, NULL ) || !res) goto done;
-            p += res;
-            count -= res;
-        }
+        do {
+            ret = DeviceIoControl( h2, IOCTL_COPYCHUNK, &copychunk, sizeof(copychunk),
+                                   &copychunk_resp, sizeof(copychunk_resp), &count, NULL );
+            copychunk.Chunk[0].SourceOffset.QuadPart += copychunk_resp.TotalBytesWritten;
+            copychunk.Chunk[0].DestinationOffset.QuadPart += copychunk_resp.TotalBytesWritten;
+        } while (ret && copychunk_resp.TotalBytesWritten);
+        /* Maintain the timestamp of source file to destination file and read-only attribute */
+        info.FileAttributes &= FILE_ATTRIBUTE_READONLY;
+        NtSetInformationFile( h2, &io, &info, sizeof(info), FileBasicInformation );
     }
-    ret = TRUE;
-done:
-    /* Maintain the timestamp of source file to destination file and read-only attribute */
-    info.FileAttributes &= FILE_ATTRIBUTE_READONLY;
-    NtSetInformationFile( h2, &io, &info, sizeof(info), FileBasicInformation );
-    HeapFree( GetProcessHeap(), 0, buffer );
     CloseHandle( h1 );
     CloseHandle( h2 );
     if (ret) SetLastError( 0 );
