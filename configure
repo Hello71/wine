@@ -20824,6 +20824,12 @@ fi
 
 ac_save_CFLAGS="$CFLAGS"
 CFLAGS="$CFLAGS $BUILTINFLAG"
+ac_fn_c_check_func "$LINENO" "copy_file_range" "ac_cv_func_copy_file_range"
+if test "x$ac_cv_func_copy_file_range" = xyes
+then :
+  printf "%s\n" "#define HAVE_COPY_FILE_RANGE 1" >>confdefs.h
+
+fi
 ac_fn_c_check_func "$LINENO" "dladdr1" "ac_cv_func_dladdr1"
 if test "x$ac_cv_func_dladdr1" = xyes
 then :

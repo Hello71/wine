@@ -381,6 +381,7 @@ NTSTATUS errno_to_status( int err )
 #ifdef ETIME /* Missing on FreeBSD */
     case ETIME:     return STATUS_IO_TIMEOUT;
 #endif
+    case ENOMEM:    return STATUS_NO_MEMORY;
     case ENOEXEC:   /* ?? */
     case EEXIST:    /* ?? */
     default:
@@ -6663,6 +6664,122 @@ NTSTATUS WINAPI NtWriteFileGather( HANDLE file, HANDLE event, PIO_APC_ROUTINE ap
 }
 
 
+static NTSTATUS netfs_DeviceIoControl( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, void *apc_context,
+                                       IO_STATUS_BLOCK *io, ULONG code, void *in_buffer, ULONG in_size,
+                                       void *out_buffer, ULONG out_size )
+{
+    /* wine extension: support IOCTL_COPYCHUNK even on local files (no way to tell with
+     * copy_file_range anyways) */
+    NTSTATUS status;
+
+    switch (code)
+    {
+    case IOCTL_PREPARE_COPYCHUNK:
+    {
+        /* wine extension: out_buffer only needs to be big enough to hold a HANDLE */
+        if (out_size < sizeof(HANDLE))
+        {
+            io->Information = 0;
+            status = STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
+        io->Information = sizeof(HANDLE);
+        *(HANDLE *)out_buffer = handle;
+        status = STATUS_SUCCESS;
+        break;
+    }
+
+    /* wine extension: support IOCTL_COPYCHUNK with chunk sizes greater than 1 MB */
+    case IOCTL_COPYCHUNK:
+    {
+        static const SIZE_T buffer_size = 65536;
+        SRV_COPYCHUNK_COPY *cc = in_buffer;
+        SRV_COPYCHUNK_RESPONSE *ccr = out_buffer;
+        int src_fd, dst_fd, src_needs_close, dst_needs_close;
+        void *buffer = NULL;
+        BOOL fallback = FALSE;
+        if (in_size < sizeof(*cc))
+        {
+            status = STATUS_INVALID_PARAMETER;
+            break;
+        }
+        if (out_size < sizeof(*ccr))
+        {
+            status = STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
+        status = server_get_unix_fd( handle, FILE_WRITE_DATA, &dst_fd, &dst_needs_close, NULL, NULL );
+        if (status) break;
+        status = server_get_unix_fd( (HANDLE)(ULONG_PTR)cc->SourceFile.ResumeKey, FILE_READ_DATA, &src_fd, &src_needs_close, NULL, NULL );
+        if (status)
+        {
+            if (dst_needs_close) close( dst_fd );
+            break;
+        }
+        io->Information = sizeof(*ccr);
+        ccr->TotalBytesWritten = 0;
+        for (ccr->ChunksWritten = 0; ccr->ChunksWritten < cc->ChunkCount; ccr->ChunksWritten++)
+        {
+            off_t off_in = cc->Chunk[ccr->ChunksWritten].SourceOffset.QuadPart;
+            off_t off_out = cc->Chunk[ccr->ChunksWritten].DestinationOffset.QuadPart;
+            size_t len = cc->Chunk[ccr->ChunksWritten].Length;
+#ifdef HAVE_COPY_FILE_RANGE
+            if (!fallback)
+            {
+                ssize_t res = copy_file_range( src_fd, &off_in, dst_fd, &off_out, len, 0 );
+                if (res == -1)
+                {
+                    if (errno == EXDEV || errno == EINVAL || errno == ENOSYS) fallback = TRUE;
+                    else goto copychunk_out;
+                }
+                else
+                {
+                    ccr->ChunkBytesWritten = ccr->TotalBytesWritten = res;
+                }
+            }
+            if (fallback)
+#endif
+            {
+                if (!buffer) buffer = malloc( buffer_size );
+                if (!buffer) goto copychunk_out;
+                ccr->ChunkBytesWritten = 0;
+                char *p = buffer;
+                ssize_t count = pread( src_fd, buffer, min( buffer_size, len ), off_in );
+                if (count == -1) goto copychunk_out;
+                off_in += count;
+                while (count)
+                {
+                    ssize_t res = pwrite( dst_fd, p, count, off_out );
+                    if (res == -1) goto copychunk_out;
+                    p += res;
+                    count -= res;
+                    off_out += res;
+                    ccr->ChunkBytesWritten += res;
+                    ccr->TotalBytesWritten += res;
+                }
+            }
+            if (ccr->ChunkBytesWritten != cc->Chunk[ccr->ChunksWritten].Length) break;
+            ccr->ChunkBytesWritten = 0;
+        }
+        errno = 0;
+
+copychunk_out:
+        if (errno) status = errno_to_status( errno );
+        else status = STATUS_SUCCESS;
+        if (buffer) free( buffer );
+        if (src_needs_close) close( src_fd );
+        if (dst_needs_close) close( dst_fd );
+        break;
+    }
+    default:
+        status = STATUS_NOT_SUPPORTED;
+    }
+
+    io->Status = status;
+    return status;
+}
+
+
 /******************************************************************************
  *              NtDeviceIoControlFile   (NTDLL.@)
  */
@@ -6684,6 +6801,10 @@ NTSTATUS WINAPI NtDeviceIoControlFile( HANDLE handle, HANDLE event, PIO_APC_ROUT
 
     switch (device)
     {
+    case FILE_DEVICE_NETWORK_FILE_SYSTEM:
+        status = netfs_DeviceIoControl( handle, event, apc, apc_context, io, code,
+                                        in_buffer, in_size, out_buffer, out_size );
+        break;
     case FILE_DEVICE_BEEP:
     case FILE_DEVICE_NETWORK:
         status = sock_ioctl( handle, event, apc, apc_context, io, code, in_buffer, in_size, out_buffer, out_size );

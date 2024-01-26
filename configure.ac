@@ -2082,7 +2082,8 @@ AC_SEARCH_LIBS(dlopen, dl)
 ac_save_CFLAGS="$CFLAGS"
 CFLAGS="$CFLAGS $BUILTINFLAG"
 AC_CHECK_FUNCS(\
-        dladdr1 \
+	copy_file_range \
+	dladdr1 \
 	dlinfo \
 	epoll_create \
 	epoll_pwait2 \
